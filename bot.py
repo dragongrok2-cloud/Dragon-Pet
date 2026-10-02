@@ -2,6 +2,7 @@
 """
 Dragon Pet — добрый бот-дракон для Lolka
 Позволяет каждому пользователю завести своего личного дракона.
+Стихии • Ежедневные награды • Таблица лидеров • Красивые эмодзи-аватары
 """
 
 import os
@@ -11,20 +12,46 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 import aiosqlite
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "dragons.db"
 
-# Настройки драконов
+# ─── Настройки ───────────────────────────────────────────────────────────────
 MAX_HUNGER = 100
 MAX_MOOD = 100
 FEED_AMOUNT = 25
 PLAY_AMOUNT = 20
-HUNGER_DECAY_HOURS = 6   # каждые 6 часов голод растёт
+HUNGER_DECAY_HOURS = 6
 MOOD_DECAY_HOURS = 8
+
+# ─── Стихии ───────────────────────────────────────────────────────────────────
+ELEMENTS = {
+    "огонь":  {"emoji": "🔥", "color": 0xE74C3C, "name": "Огонь",  "bonus": "Сила пламени"},
+    "вода":   {"emoji": "💧", "color": 0x3498DB, "name": "Вода",   "bonus": "Глубокие воды"},
+    "земля":  {"emoji": "🌍", "color": 0x27AE60, "name": "Земля",  "bonus": "Каменная броня"},
+    "воздух": {"emoji": "🌪️", "color": 0x95A5A6, "name": "Воздух", "bonus": "Быстрый полёт"},
+    "тень":   {"emoji": "🌑", "color": 0x2C3E50, "name": "Тень",   "bonus": "Скрытность"},
+    "свет":   {"emoji": "✨", "color": 0xF1C40F, "name": "Свет",   "bonus": "Сияние"},
+}
+
+# ─── Эмодзи-аватары по уровню и стихии ───────────────────────────────────────
+def get_dragon_avatar(element: str, level: int) -> str:
+    """Возвращает красивый эмодзи-аватар в зависимости от стихии и уровня."""
+    stage = "baby" if level < 5 else "young" if level < 15 else "adult" if level < 30 else "ancient"
+
+    avatars = {
+        "огонь":  {"baby": "🐣🔥", "young": "🐲🔥", "adult": "🐉🔥", "ancient": "🔥🐉🔥"},
+        "вода":   {"baby": "🐣💧", "young": "🐲💧", "adult": "🐉💧", "ancient": "💧🐉💧"},
+        "земля":  {"baby": "🐣🌍", "young": "🐲🌍", "adult": "🐉🌍", "ancient": "🌍🐉🌍"},
+        "воздух": {"baby": "🐣🌪️", "young": "🐲🌪️", "adult": "🐉🌪️", "ancient": "🌪️🐉🌪️"},
+        "тень":   {"baby": "🐣🌑", "young": "🐲🌑", "adult": "🐉🌑", "ancient": "🌑🐉🌑"},
+        "свет":   {"baby": "🐣✨", "young": "🐲✨", "adult": "🐉✨", "ancient": "✨🐉✨"},
+    }
+    return avatars.get(element, avatars["огонь"]).get(stage, "🐉")
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -32,21 +59,33 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# ─── База данных ──────────────────────────────────────────────────────────────
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS dragons (
                 user_id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL,
+                element TEXT DEFAULT 'огонь',
                 level INTEGER DEFAULT 1,
                 exp INTEGER DEFAULT 0,
                 hunger INTEGER DEFAULT 50,
                 mood INTEGER DEFAULT 70,
                 created_at TEXT NOT NULL,
                 last_feed TEXT,
-                last_play TEXT
+                last_play TEXT,
+                last_daily TEXT
             )
         """)
+        # Миграция на случай старой базы
+        try:
+            await db.execute("ALTER TABLE dragons ADD COLUMN element TEXT DEFAULT 'огонь'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE dragons ADD COLUMN last_daily TEXT")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -81,7 +120,6 @@ async def apply_decay(dragon: dict) -> dict:
     now = datetime.now(timezone.utc)
     updated = False
 
-    # Голод
     last_feed = dragon.get("last_feed")
     if last_feed:
         last = datetime.fromisoformat(last_feed)
@@ -91,7 +129,6 @@ async def apply_decay(dragon: dict) -> dict:
             dragon["hunger"] = max(0, dragon["hunger"] - decay)
             updated = True
 
-    # Настроение
     last_play = dragon.get("last_play")
     if last_play:
         last = datetime.fromisoformat(last_play)
@@ -113,23 +150,37 @@ async def apply_decay(dragon: dict) -> dict:
 def make_embed(dragon: dict, title: str = None) -> discord.Embed:
     level = calculate_level(dragon["exp"])
     next_exp = exp_for_next_level(level)
-    progress = dragon["exp"] % 100
+    element = dragon.get("element", "огонь")
+    elem_data = ELEMENTS.get(element, ELEMENTS["огонь"])
+    avatar = get_dragon_avatar(element, level)
 
     hunger_bar = "🟩" * (dragon["hunger"] // 10) + "⬛" * (10 - dragon["hunger"] // 10)
     mood_bar = "💖" * (dragon["mood"] // 10) + "🖤" * (10 - dragon["mood"] // 10)
 
-    color = 0x57F287  # зелёный
-    if dragon["hunger"] < 30 or dragon["mood"] < 30:
-        color = 0xFEE75C  # жёлтый
+    # Цвет от стихии, но предупреждающий если плохое состояние
+    color = elem_data["color"]
     if dragon["hunger"] < 15 or dragon["mood"] < 15:
-        color = 0xED4245  # красный
+        color = 0xED4245
+    elif dragon["hunger"] < 30 or dragon["mood"] < 30:
+        color = 0xFEE75C
 
     embed = discord.Embed(
-        title=title or f"🐉 {dragon['name']}",
+        title=title or f"{avatar} {dragon['name']}",
         color=color,
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(name="Уровень", value=f"**{level}** (опыт {dragon['exp']}/{next_exp})", inline=True)
+    embed.add_field(
+        name="Стихия",
+        value=f"{elem_data['emoji']} **{elem_data['name']}**\n*{elem_data['bonus']}*",
+        inline=True
+    )
+    embed.add_field(
+        name="Уровень",
+        value=f"**{level}**\nопыт {dragon['exp']}/{next_exp}",
+        inline=True
+    )
+    embed.add_field(name="\u200b", value="\u200b", inline=True)  # пустое поле для выравнивания
+
     embed.add_field(name="Голод", value=f"{hunger_bar}\n{dragon['hunger']}/100", inline=False)
     embed.add_field(name="Настроение", value=f"{mood_bar}\n{dragon['mood']}/100", inline=False)
 
@@ -141,10 +192,11 @@ def make_embed(dragon: dict, title: str = None) -> discord.Embed:
     if not status:
         status.append("Доволен и счастлив!")
 
-    embed.set_footer(text=" • ".join(status))
+    embed.set_footer(text=f"{avatar}  " + " • ".join(status))
     return embed
 
 
+# ─── События ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     await init_db()
@@ -156,23 +208,41 @@ async def on_ready():
     print(f"🐉 Dragon Pet готов! Вошёл как {bot.user}")
 
 
+# ─── Основная команда /dragon ─────────────────────────────────────────────────
 @bot.tree.command(name="dragon", description="Управление своим драконом")
 @app_commands.describe(
     action="Что сделать",
-    name="Имя дракона (для create и rename)"
+    name="Имя дракона (для create и rename)",
+    element="Стихия дракона (только при create)"
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="create — завести дракона", value="create"),
     app_commands.Choice(name="info — статус дракона", value="info"),
     app_commands.Choice(name="feed — покормить", value="feed"),
     app_commands.Choice(name="play — поиграть", value="play"),
+    app_commands.Choice(name="daily — ежедневная награда", value="daily"),
+    app_commands.Choice(name="top — таблица лидеров", value="top"),
     app_commands.Choice(name="rename — переименовать", value="rename"),
     app_commands.Choice(name="release — отпустить", value="release"),
 ])
-async def dragon_command(interaction: discord.Interaction, action: str, name: str = None):
+@app_commands.choices(element=[
+    app_commands.Choice(name="🔥 Огонь", value="огонь"),
+    app_commands.Choice(name="💧 Вода", value="вода"),
+    app_commands.Choice(name="🌍 Земля", value="земля"),
+    app_commands.Choice(name="🌪️ Воздух", value="воздух"),
+    app_commands.Choice(name="🌑 Тень", value="тень"),
+    app_commands.Choice(name="✨ Свет", value="свет"),
+])
+async def dragon_command(
+    interaction: discord.Interaction,
+    action: str,
+    name: str = None,
+    element: str = None
+):
     user_id = interaction.user.id
     dragon = await get_dragon(user_id)
 
+    # ── CREATE ───────────────────────────────────────────────────────────────
     if action == "create":
         if dragon:
             await interaction.response.send_message(
@@ -182,28 +252,80 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
             return
         if not name or len(name) < 2 or len(name) > 20:
             await interaction.response.send_message(
-                "Пожалуйста, укажи имя дракона от 2 до 20 символов.\nПример: `/dragon create Огонёк`",
+                "Пожалуйста, укажи имя дракона от 2 до 20 символов.\n"
+                "Пример: `/dragon create Огонёк element:Огонь`",
                 ephemeral=True
             )
             return
 
+        # Если стихию не выбрали — случайная
+        if not element:
+            element = random.choice(list(ELEMENTS.keys()))
+
         now = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT INTO dragons (user_id, name, created_at, last_feed, last_play) VALUES (?, ?, ?, ?, ?)",
-                (user_id, name, now, now, now)
+                """INSERT INTO dragons
+                   (user_id, name, element, created_at, last_feed, last_play)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (user_id, name, element, now, now, now)
             )
             await db.commit()
 
+        elem_data = ELEMENTS[element]
+        avatar = get_dragon_avatar(element, 1)
+
         embed = discord.Embed(
-            title="🎉 Новый дракон появился!",
-            description=f"**{name}** теперь твой верный спутник!\n\nКорми его, играй и растите вместе.",
-            color=0x57F287
+            title=f"{avatar} Новый дракон появился!",
+            description=(
+                f"**{name}** теперь твой верный спутник!\n\n"
+                f"Стихия: {elem_data['emoji']} **{elem_data['name']}**\n"
+                f"*{elem_data['bonus']}*\n\n"
+                f"Корми его, играй и растите вместе."
+            ),
+            color=elem_data["color"]
         )
         embed.set_footer(text="Используй /dragon info чтобы посмотреть статус")
         await interaction.response.send_message(embed=embed)
         return
 
+    # ── TOP (таблица лидеров) — доступна всем ────────────────────────────────
+    if action == "top":
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT user_id, name, element, exp FROM dragons ORDER BY exp DESC LIMIT 10"
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        if not rows:
+            await interaction.response.send_message("Пока нет ни одного дракона... Будь первым!")
+            return
+
+        embed = discord.Embed(
+            title="🏆 Таблица лидеров — Топ-10 драконов",
+            color=0xF1C40F,
+            timestamp=datetime.now(timezone.utc)
+        )
+
+        medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+        lines = []
+        for i, row in enumerate(rows):
+            level = calculate_level(row["exp"])
+            elem = row["element"] or "огонь"
+            avatar = get_dragon_avatar(elem, level)
+            medal = medals[i]
+            lines.append(
+                f"{medal} **{row['name']}** {avatar}\n"
+                f"  Ур. {level} • {ELEMENTS.get(elem, ELEMENTS['огонь'])['emoji']} {ELEMENTS.get(elem, ELEMENTS['огонь'])['name']} • {row['exp']} опыта"
+            )
+
+        embed.description = "\n\n".join(lines)
+        embed.set_footer(text="Расти своего дракона и займи место на вершине!")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # Дальше нужны наличие дракона
     if not dragon:
         await interaction.response.send_message(
             "У тебя ещё нет дракона! Заведи его командой:\n`/dragon create <имя>`",
@@ -211,14 +333,18 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
         )
         return
 
-    # Применяем спад голода/настроения
+    # Применяем спад
     dragon = await apply_decay(dragon)
+    element = dragon.get("element", "огонь")
+    elem_data = ELEMENTS.get(element, ELEMENTS["огонь"])
 
+    # ── INFO ─────────────────────────────────────────────────────────────────
     if action == "info":
         embed = make_embed(dragon)
         await interaction.response.send_message(embed=embed)
         return
 
+    # ── FEED ─────────────────────────────────────────────────────────────────
     if action == "feed":
         if dragon["hunger"] >= 95:
             await interaction.response.send_message(
@@ -244,6 +370,7 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
         await interaction.response.send_message(embed=embed)
         return
 
+    # ── PLAY ─────────────────────────────────────────────────────────────────
     if action == "play":
         if dragon["mood"] >= 95:
             await interaction.response.send_message(
@@ -254,7 +381,6 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
 
         new_mood = min(MAX_MOOD, dragon["mood"] + PLAY_AMOUNT)
         new_exp = dragon["exp"] + random.randint(8, 15)
-        # Игра немного увеличивает голод
         new_hunger = max(0, dragon["hunger"] - 5)
         now = datetime.now(timezone.utc).isoformat()
 
@@ -272,6 +398,60 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
         await interaction.response.send_message(embed=embed)
         return
 
+    # ── DAILY ────────────────────────────────────────────────────────────────
+    if action == "daily":
+        now = datetime.now(timezone.utc)
+        last_daily = dragon.get("last_daily")
+
+        if last_daily:
+            last = datetime.fromisoformat(last_daily)
+            if (now - last) < timedelta(hours=20):  # чуть меньше суток, чтобы было удобно
+                remaining = timedelta(hours=20) - (now - last)
+                hours = int(remaining.total_seconds() // 3600)
+                minutes = int((remaining.total_seconds() % 3600) // 60)
+                await interaction.response.send_message(
+                    f"Ежедневная награда уже получена!\n"
+                    f"Приходи через **{hours}ч {minutes}м**.",
+                    ephemeral=True
+                )
+                return
+
+        # Награда
+        exp_gain = random.randint(30, 60)
+        hunger_gain = random.randint(15, 30)
+        mood_gain = random.randint(15, 30)
+
+        new_exp = dragon["exp"] + exp_gain
+        new_hunger = min(MAX_HUNGER, dragon["hunger"] + hunger_gain)
+        new_mood = min(MAX_MOOD, dragon["mood"] + mood_gain)
+
+        await update_dragon(
+            user_id,
+            exp=new_exp,
+            hunger=new_hunger,
+            mood=new_mood,
+            last_daily=now.isoformat()
+        )
+        dragon["exp"] = new_exp
+        dragon["hunger"] = new_hunger
+        dragon["mood"] = new_mood
+
+        avatar = get_dragon_avatar(element, calculate_level(new_exp))
+        embed = discord.Embed(
+            title=f"{avatar} Ежедневная награда!",
+            description=(
+                f"**{dragon['name']}** получил подарки:\n\n"
+                f"✨ **+{exp_gain}** опыта\n"
+                f"🍖 **+{hunger_gain}** сытости\n"
+                f"💖 **+{mood_gain}** настроения"
+            ),
+            color=elem_data["color"]
+        )
+        embed = make_embed(dragon, title=f"{avatar} Ежедневная награда получена!")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # ── RENAME ───────────────────────────────────────────────────────────────
     if action == "rename":
         if not name or len(name) < 2 or len(name) > 20:
             await interaction.response.send_message(
@@ -286,8 +466,8 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
         )
         return
 
+    # ── RELEASE ──────────────────────────────────────────────────────────────
     if action == "release":
-        # Простое подтверждение через ephemeral + followup можно улучшить позже
         await interaction.response.send_message(
             f"Ты уверен, что хочешь отпустить **{dragon['name']}**?\n"
             f"Это действие необратимо.\n\n"
@@ -297,6 +477,7 @@ async def dragon_command(interaction: discord.Interaction, action: str, name: st
         return
 
 
+# ─── Подтверждение отпускания ─────────────────────────────────────────────────
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
